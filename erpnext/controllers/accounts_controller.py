@@ -308,7 +308,7 @@ class AccountsController(TransactionBase):
 		self.set_default_letter_head()
 		self.validate_company_in_accounting_dimension()
 		self.validate_party_address_and_contact()
-		self.validate_company_linked_addresses()
+		# self.validate_company_linked_addresses()
 
 	def validate_company_linked_addresses(self):
 		address_fields = []
