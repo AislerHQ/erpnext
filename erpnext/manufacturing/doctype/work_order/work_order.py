@@ -315,8 +315,8 @@ class WorkOrder(Document):
 	def validate_work_order_against_so(self):
 		# already ordered qty
 		ordered_qty_against_so = frappe.db.sql(
-			"""select sum(qty) from `tabWork Order`
-			where production_item = %s and sales_order = %s and docstatus < 2 and name != %s""",
+			"""select sum(qty - process_loss_qty) from `tabWork Order`
+			where production_item = %s and sales_order = %s and docstatus < 2 and status != 'Closed' and name != %s""",
 			(self.production_item, self.sales_order, self.name),
 		)[0][0]
 
@@ -351,15 +351,16 @@ class WorkOrder(Document):
 
 	def update_status(self, status=None):
 		"""Update status of work order if unknown"""
-		if status != "Stopped" and status != "Closed":
-			status = self.get_status(status)
+		if self.status != "Closed":
+			if status not in ["Stopped", "Closed"]:
+				status = self.get_status(status)
 
-		if status != self.status:
-			self.db_set("status", status)
+			if status != self.status:
+				self.db_set("status", status)
 
 		self.update_required_items()
 
-		return status
+		return status or self.status
 
 	def get_status(self, status=None):
 		"""Return the status based on stock entries against this work order"""
@@ -515,6 +516,9 @@ class WorkOrder(Document):
 		self.validate_cancel()
 		self.db_set("status", "Cancelled")
 
+		self.on_close_or_cancel()
+
+	def on_close_or_cancel(self):
 		if self.production_plan and frappe.db.exists(
 			"Production Plan Item Reference", {"parent": self.production_plan}
 		):
@@ -522,12 +526,10 @@ class WorkOrder(Document):
 		else:
 			self.update_work_order_qty_in_so()
 
-		self.delete_job_card()
 		self.update_completed_qty_in_material_request()
 		self.update_planned_qty()
 		self.update_ordered_qty()
 		self.update_reserved_qty_for_production()
-		self.delete_auto_created_batch_and_serial_no()
 
 	def create_serial_no_batch_no(self):
 		if not (self.has_serial_no or self.has_batch_no):
@@ -583,13 +585,6 @@ class WorkOrder(Document):
 					}
 				)
 			)
-
-	def delete_auto_created_batch_and_serial_no(self):
-		for row in frappe.get_all("Serial No", filters={"work_order": self.name}):
-			frappe.delete_doc("Serial No", row.name)
-
-		for row in frappe.get_all("Batch", filters={"reference_name": self.name}):
-			frappe.delete_doc("Batch", row.name)
 
 	def make_serial_nos(self, args):
 		item_details = frappe.get_cached_value(
@@ -842,7 +837,7 @@ class WorkOrder(Document):
 
 		qty = frappe.db.sql(
 			f""" select sum(qty) from
-			`tabWork Order` where sales_order = %s and docstatus = 1 and {cond}
+			`tabWork Order` where sales_order = %s and docstatus = 1 and status <> 'Closed' and {cond}
 			""",
 			(self.sales_order, (self.product_bundle_item or self.production_item)),
 			as_list=1,
@@ -1023,10 +1018,6 @@ class WorkOrder(Document):
 		if self.actual_start_date and self.actual_end_date:
 			self.lead_time = flt(time_diff_in_hours(self.actual_end_date, self.actual_start_date) * 60)
 
-	def delete_job_card(self):
-		for d in frappe.get_all("Job Card", ["name"], {"work_order": self.name}):
-			frappe.delete_doc("Job Card", d.name)
-
 	def validate_production_item(self):
 		if frappe.get_cached_value("Item", self.production_item, "has_variants"):
 			frappe.throw(_("Work Order cannot be raised against a Item Template"), ItemHasVariantError)
@@ -1169,6 +1160,7 @@ class WorkOrder(Document):
 							"operation": item.operation or operation,
 							"item_code": item.item_code,
 							"item_name": item.item_name,
+							"stock_uom": item.stock_uom,
 							"description": item.description,
 							"allow_alternative_item": item.allow_alternative_item,
 							"required_qty": item.qty,
@@ -1193,7 +1185,7 @@ class WorkOrder(Document):
 			.select(
 				ste_child.item_code,
 				ste_child.original_item,
-				fn.Sum(ste_child.qty).as_("qty"),
+				fn.Sum(ste_child.transfer_qty).as_("qty"),
 			)
 			.where(
 				(ste.docstatus == 1)
@@ -1223,7 +1215,7 @@ class WorkOrder(Document):
 			.select(
 				ste_child.item_code,
 				ste_child.original_item,
-				fn.Sum(ste_child.qty).as_("qty"),
+				fn.Sum(ste_child.transfer_qty).as_("qty"),
 			)
 			.where(
 				(ste.docstatus == 1)
@@ -1604,7 +1596,7 @@ def close_work_order(work_order, status):
 			)
 
 	work_order.update_status(status)
-	work_order.update_planned_qty()
+	work_order.on_close_or_cancel()
 	frappe.msgprint(_("Work Order has been {0}").format(status))
 	work_order.notify_update()
 	return work_order.status
@@ -1761,6 +1753,7 @@ def create_pick_list(source_name, target_doc=None, for_qty=None):
 		target_doc,
 	)
 
+	doc.purpose = "Material Transfer for Manufacture"
 	doc.for_qty = for_qty
 
 	doc.set_item_locations()
@@ -1782,6 +1775,9 @@ def get_reserved_qty_for_production(
 		qty_field = wo_item.required_qty
 	else:
 		qty_field = Case()
+		qty_field = qty_field.when(
+			((wo.skip_transfer == 0) & (wo_item.transferred_qty > wo_item.required_qty)), 0.0
+		)
 		qty_field = qty_field.when(wo.skip_transfer == 0, wo_item.required_qty - wo_item.transferred_qty)
 		qty_field = qty_field.else_(wo_item.required_qty - wo_item.consumed_qty)
 

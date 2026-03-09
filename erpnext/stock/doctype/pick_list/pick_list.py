@@ -383,7 +383,7 @@ class PickList(TransactionBase):
 		picked_items = get_picked_items_qty(packed_items, contains_packed_items=True)
 		self.validate_picked_qty(picked_items)
 
-		doc_updates = {}
+		doc_updates = {item: {"picked_qty": 0} for item in set(packed_items)}
 		for d in picked_items:
 			doc_updates[d.product_bundle_item] = {"picked_qty": flt(d.picked_qty)}
 
@@ -394,7 +394,7 @@ class PickList(TransactionBase):
 		picked_items = get_picked_items_qty(so_items)
 		self.validate_picked_qty(picked_items)
 
-		doc_updates = {}
+		doc_updates = {item: {"picked_qty": 0} for item in set(so_items)}
 		for d in picked_items:
 			doc_updates[d.sales_order_item] = {"picked_qty": flt(d.picked_qty)}
 
@@ -997,12 +997,11 @@ def validate_picked_materials(item_code, required_qty, locations, picked_item_de
 	if remaining_qty > 0:
 		if picked_item_details:
 			frappe.msgprint(
-				_("{0} units of Item {1} is picked in another Pick List.").format(
-					remaining_qty, get_link_to_form("Item", item_code)
-				),
+				_(
+					"{0} units of Item {1} is not available in any of the warehouses. Other Pick Lists exist for this item."
+				).format(remaining_qty, get_link_to_form("Item", item_code)),
 				title=_("Already Picked"),
 			)
-
 		else:
 			frappe.msgprint(
 				_("{0} units of Item {1} is not available in any of the warehouses.").format(
@@ -1557,7 +1556,7 @@ def update_common_item_properties(item, location):
 	item.item_code = location.item_code
 	item.s_warehouse = location.warehouse
 	item.transfer_qty = location.picked_qty
-	item.qty = location.qty
+	item.qty = flt(location.picked_qty / (location.conversion_factor or 1), location.precision("qty"))
 	item.uom = location.uom
 	item.conversion_factor = location.conversion_factor
 	item.stock_uom = location.stock_uom

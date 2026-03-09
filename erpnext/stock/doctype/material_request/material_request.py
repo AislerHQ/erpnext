@@ -273,6 +273,9 @@ class MaterialRequest(BuyingController):
 				.groupby(doctype.material_request_item)
 			)
 
+			if self.material_request_type == "Manufacture":
+				query = query.where(doctype.status != "Closed")
+
 			mr_items_ordered_qty = frappe._dict(query.run())
 
 		return mr_items_ordered_qty
@@ -295,7 +298,8 @@ class MaterialRequest(BuyingController):
 
 					if mr_qty_allowance:
 						allowed_qty = flt(
-							(d.qty + (d.qty * (mr_qty_allowance / 100))), d.precision("ordered_qty")
+							(d.stock_qty + (d.stock_qty * (mr_qty_allowance / 100))),
+							d.precision("ordered_qty"),
 						)
 
 						if d.ordered_qty and flt(d.ordered_qty, precision) > flt(allowed_qty, precision):
@@ -703,6 +707,9 @@ def make_stock_entry(source_name, target_doc=None):
 		target.purpose = source.material_request_type
 		target.from_warehouse = source.set_from_warehouse
 		target.to_warehouse = source.set_warehouse
+		if source.material_request_type == "Material Issue":
+			target.from_warehouse = source.set_warehouse
+			target.to_warehouse = None
 
 		if source.job_card:
 			target.purpose = "Material Transfer for Manufacture"
