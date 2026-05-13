@@ -297,13 +297,6 @@ frappe.ui.form.on("Purchase Order Item", {
 			}
 		}
 	},
-
-	delivered_by_supplier: function (frm, cdt, cdn) {
-		const row = locals[cdt][cdn];
-		if (row.delivered_by_supplier && row.warehouse) {
-			frappe.model.set_value(cdt, cdn, "warehouse", null);
-		}
-	},
 });
 
 erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
@@ -391,8 +384,8 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 
 				if (is_drop_ship && doc.status != "Delivered") {
 					this.frm.add_custom_button(
-						__("Delivered"),
-						this.delivered_by_supplier.bind(this),
+						__("Deliver (Dropship)"),
+						this.update_dropship_delivered_qty.bind(this),
 						__("Status")
 					);
 
@@ -781,7 +774,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 		cur_frm.cscript.update_status("Close", "Closed");
 	}
 
-	delivered_by_supplier() {
+	update_dropship_delivered_qty() {
 		cur_frm.cscript.update_status("Deliver", "Delivered");
 	}
 
