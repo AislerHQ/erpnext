@@ -476,7 +476,7 @@ def get_basic_details(args, item, overwrite_warehouse=True):
 			if args.get("doctype") in ["Sales Invoice", "Purchase Invoice"]
 			else 0,
 			"delivered_by_supplier": item.delivered_by_supplier
-			if args.get("doctype") in ["Sales Order", "Sales Invoice"]
+			if args.get("doctype") in ["Sales Order", "Sales Invoice", "Purchase Order"]
 			else 0,
 			"is_fixed_asset": item.is_fixed_asset,
 			"last_purchase_rate": item.last_purchase_rate if args.get("doctype") in ["Purchase Order"] else 0,
