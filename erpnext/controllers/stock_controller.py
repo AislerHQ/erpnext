@@ -177,13 +177,18 @@ class StockController(AccountsController):
 		)
 
 		is_asset_pr = any(d.get("is_fixed_asset") for d in self.get("items"))
+		need_inventory_map = (self.get_stock_items() or self.get("packed_items")) and cint(
+			erpnext.is_perpetual_inventory_enabled(self.company)
+		)
 
 		if (
 			cint(erpnext.is_perpetual_inventory_enabled(self.company))
 			or provisional_accounting_for_non_stock_items
 			or is_asset_pr
 		):
-			warehouse_account = get_warehouse_account_map(self.company)
+			warehouse_account = frappe._dict()
+			if need_inventory_map:
+				warehouse_account = get_warehouse_account_map(self.company)
 
 			if self.docstatus == 1:
 				if not gl_entries:
@@ -263,6 +268,10 @@ class StockController(AccountsController):
 			parent_details = self.get_parent_details_for_packed_items()
 
 		for row in self.get(table_name):
+			item_code = row.get("rm_item_code") or row.get("item_code")
+			if not item_code or not self.is_serial_batch_item(item_code):
+				continue
+
 			if (
 				not via_landed_cost_voucher
 				and row.serial_and_batch_bundle
@@ -1509,9 +1518,10 @@ class StockController(AccountsController):
 
 
 @frappe.whitelist()
-def show_accounting_ledger_preview(company, doctype, docname):
+def show_accounting_ledger_preview(company: str, doctype: str, docname: str):
 	filters = frappe._dict(company=company, include_dimensions=1)
 	doc = frappe.get_doc(doctype, docname)
+	doc.check_permission("read")
 	doc.run_method("before_gl_preview")
 
 	gl_columns, gl_data = get_accounting_ledger_preview(doc, filters)
@@ -1522,9 +1532,10 @@ def show_accounting_ledger_preview(company, doctype, docname):
 
 
 @frappe.whitelist()
-def show_stock_ledger_preview(company, doctype, docname):
-	filters = frappe._dict(company=company)
+def show_stock_ledger_preview(company: str, doctype: str, docname: str):
+	filters = frappe._dict(company=company, valuation_field_type="Currency")
 	doc = frappe.get_doc(doctype, docname)
+	doc.check_permission("read")
 	doc.run_method("before_sl_preview")
 
 	sl_columns, sl_data = get_stock_ledger_preview(doc, filters)
@@ -1563,7 +1574,7 @@ def get_accounting_ledger_preview(doc, filters):
 	columns = get_gl_columns(filters)
 	gl_entries = get_gl_entries_for_preview(doc.doctype, doc.name, fields)
 
-	gl_columns = get_columns(columns, fields)
+	gl_columns = get_columns(columns, fields, erpnext.get_company_currency(filters.company))
 	gl_data = get_data(fields, gl_entries)
 
 	return gl_columns, gl_data
@@ -1605,7 +1616,7 @@ def get_stock_ledger_preview(doc, filters):
 		columns = get_sl_columns(filters)
 		sl_entries = get_sl_entries_for_preview(doc.doctype, doc.name, fields)
 
-		sl_columns = get_columns(columns, columns_fields)
+		sl_columns = get_columns(columns, columns_fields, erpnext.get_company_currency(filters.company))
 		sl_data = get_data(columns_fields, sl_entries)
 
 	return sl_columns, sl_data
@@ -1624,7 +1635,8 @@ def get_sl_entries_for_preview(doctype, docname, fields):
 			entry["out_qty"] = abs(entry.actual_qty)
 			entry["in_qty"] = 0
 
-		entry["in_out_rate"] = entry["valuation_rate"]
+		if entry.actual_qty < 0:
+			entry["in_out_rate"] = entry.stock_value_difference / entry.actual_qty
 
 	return sl_entries
 
@@ -1633,12 +1645,23 @@ def get_gl_entries_for_preview(doctype, docname, fields):
 	return frappe.get_all("GL Entry", filters={"voucher_type": doctype, "voucher_no": docname}, fields=fields)
 
 
-def get_columns(raw_columns, fields):
-	return [
-		{"name": d.get("label"), "editable": False, "width": 110, "fieldtype": d.get("fieldtype")}
-		for d in raw_columns
-		if not d.get("hidden") and d.get("fieldname") in fields
-	]
+def get_columns(raw_columns, fields, currency):
+	columns = []
+	for source_column in raw_columns:
+		if source_column.get("hidden") or source_column.get("fieldname") not in fields:
+			continue
+
+		column = {
+			"name": source_column.get("label"),
+			"editable": False,
+			"width": 110,
+			"fieldtype": source_column.get("fieldtype"),
+		}
+		if column["fieldtype"] == "Currency":
+			column["options"] = currency
+		columns.append(column)
+
+	return columns
 
 
 def get_data(raw_columns, raw_data):
@@ -1765,6 +1788,11 @@ def is_reposting_pending():
 	return frappe.db.exists(
 		"Repost Item Valuation", {"docstatus": 1, "status": ["in", ["Queued", "In Progress"]]}
 	)
+
+
+def invalidate_future_sle_cache(voucher_type, voucher_no):
+	if hasattr(frappe.local, "future_sle"):
+		frappe.local.future_sle.pop((voucher_type, voucher_no), None)
 
 
 def future_sle_exists(args, sl_entries=None):

@@ -47,7 +47,7 @@ from erpnext.stock.doctype.stock_reconciliation.test_stock_reconciliation import
 	create_stock_reconciliation,
 )
 from erpnext.stock.get_item_details import get_item_tax_map
-from erpnext.stock.utils import get_incoming_rate, get_stock_balance
+from erpnext.stock.utils import _get_incoming_rate, get_stock_balance
 
 
 class TestSalesInvoice(FrappeTestCase):
@@ -1232,6 +1232,33 @@ class TestSalesInvoice(FrappeTestCase):
 		self.assertEqual(pos.change_amount, 10)
 
 		self.validate_pos_gl_entry(pos, pos, 60, validate_without_change_gle=True)
+
+		frappe.db.set_single_value("Accounts Settings", "post_change_gl_entries", 1)
+
+	def test_pos_change_amount_multi_currency_gl_entry(self):
+		frappe.db.set_single_value("Accounts Settings", "post_change_gl_entries", 0)
+
+		si = create_sales_invoice(do_not_save=True)
+		si.is_pos = 1
+		si.currency = "USD"
+		si.conversion_rate = 50
+		si.party_account_currency = "USD"
+		si.account_for_change_amount = "Cash - _TC"
+		si.change_amount = 50
+		si.base_change_amount = 2500
+		si.append(
+			"payments",
+			{"mode_of_payment": "Cash", "account": "Cash - _TC", "amount": 150, "base_amount": 7500},
+		)
+
+		gl_entries = []
+		si.make_pos_gl_entries(gl_entries)
+
+		debtors_entry = next(entry for entry in gl_entries if entry["account"] == si.debit_to)
+		cash_entry = next(entry for entry in gl_entries if entry["account"] == "Cash - _TC")
+
+		self.assertEqual(flt(debtors_entry["credit"]), 5000.0)
+		self.assertEqual(flt(cash_entry["debit"]), 5000.0)
 
 		frappe.db.set_single_value("Accounts Settings", "post_change_gl_entries", 1)
 
@@ -2802,12 +2829,15 @@ class TestSalesInvoice(FrappeTestCase):
 
 		old_perpetual_inventory = erpnext.is_perpetual_inventory_enabled("_Test Company 1")
 		frappe.local.enable_perpetual_inventory["_Test Company 1"] = 1
+		old_inventory_account = frappe.db.get_value("Company", "_Test Company 1", "default_inventory_account")
 
 		frappe.db.set_value(
 			"Company",
 			"_Test Company 1",
-			"stock_received_but_not_billed",
-			"Stock Received But Not Billed - _TC1",
+			{
+				"stock_received_but_not_billed": "Stock Received But Not Billed - _TC1",
+				"default_inventory_account": "Stock In Hand - _TC1",
+			},
 		)
 		frappe.db.set_value(
 			"Company",
@@ -2852,6 +2882,7 @@ class TestSalesInvoice(FrappeTestCase):
 
 		# tear down
 		frappe.local.enable_perpetual_inventory["_Test Company 1"] = old_perpetual_inventory
+		frappe.db.set_value("Company", "_Test Company 1", "default_inventory_account", old_inventory_account)
 		frappe.db.set_single_value("Stock Settings", "allow_negative_stock", old_negative_stock)
 
 	def test_sle_for_target_warehouse(self):
@@ -2912,7 +2943,7 @@ class TestSalesInvoice(FrappeTestCase):
 
 		rate = 0.0
 		for d in si.get("items"):
-			rate = get_incoming_rate(
+			rate = _get_incoming_rate(
 				{
 					"item_code": d.item_code,
 					"warehouse": d.warehouse,

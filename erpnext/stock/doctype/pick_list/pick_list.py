@@ -71,7 +71,9 @@ class PickList(TransactionBase):
 		purpose: DF.Literal["Material Transfer for Manufacture", "Material Transfer", "Delivery"]
 		scan_barcode: DF.Data | None
 		scan_mode: DF.Check
-		status: DF.Literal["Draft", "Open", "Partly Delivered", "Completed", "Cancelled"]
+		status: DF.Literal[
+			"Draft", "Open", "Partly Delivered", "Partially Transferred", "Completed", "Cancelled"
+		]
 		work_order: DF.Link | None
 	# end: auto-generated types
 
@@ -398,6 +400,34 @@ class PickList(TransactionBase):
 
 		return stock_entry_exists(self.name)
 
+	def get_transfer_status(self):
+		"""Return the pick list's transfer progress based on how much of the picked qty has been
+		moved into submitted Stock Entries (tracked on Pick List Item.transferred_qty).
+
+		Only applies to purposes that move stock via Stock Entry; the Delivery purpose is tracked
+		via delivery_status instead. Returns "Completed", "Partially Transferred" or None."""
+		if self.purpose == "Delivery":
+			return None
+
+		total_picked = sum(flt(row.picked_qty) for row in self.locations)
+		if not total_picked:
+			return None
+
+		total_transferred = sum(flt(row.transferred_qty) for row in self.locations)
+		if total_transferred <= 0:
+			return None
+
+		if total_transferred >= total_picked:
+			return "Completed"
+
+		return "Partially Transferred"
+
+	def is_fully_transferred(self):
+		return self.get_transfer_status() == "Completed"
+
+	def is_partially_transferred(self):
+		return self.get_transfer_status() == "Partially Transferred"
+
 	def update_reference_qty(self):
 		packed_items = []
 		so_items = []
@@ -445,9 +475,10 @@ class PickList(TransactionBase):
 		for sales_order in sales_orders:
 			frappe.get_doc("Sales Order", sales_order, for_update=True).update_picking_status()
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def create_stock_reservation_entries(self, notify=True) -> None:
 		"""Creates Stock Reservation Entries for Sales Order Items against Pick List."""
+		self.check_permission("write")
 
 		so_items_details_map = {}
 		for location in self.locations:
@@ -466,15 +497,18 @@ class PickList(TransactionBase):
 		if so_items_details_map:
 			for so, items_details in so_items_details_map.items():
 				so_doc = frappe.get_doc("Sales Order", so)
-				so_doc.create_stock_reservation_entries(
+				# internal: reserving against someone else's Sales Order, and no role that
+				# creates a Pick List holds Sales Order write
+				so_doc._create_stock_reservation_entries(
 					items_details=items_details,
 					from_voucher_type="Pick List",
 					notify=notify,
 				)
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def cancel_stock_reservation_entries(self, notify=True) -> None:
 		"""Cancel Stock Reservation Entries for Sales Order Items created against Pick List."""
+		self.check_permission("write")
 
 		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 			cancel_stock_reservation_entries,
@@ -497,8 +531,13 @@ class PickList(TransactionBase):
 					).format(row.item_code, row.sales_order)
 				)
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def set_item_locations(self, save=False):
+		# only for a list that already exists: the mappers reach this on an unsaved one, where insert()
+		# checks `create` anyway. Test the record, not is_new() -- `__islocal` is client-supplied.
+		if self.name and frappe.db.exists("Pick List", self.name):
+			self.check_permission("write")
+
 		self.validate_for_qty()
 		items = self.aggregate_item_qty()
 		picked_items_details = self.get_picked_items_details(items)
@@ -1309,6 +1348,9 @@ def create_dn_wo_so(pick_list, delivery_note=None):
 
 	delivery_note.company = pick_list.company
 
+	if not delivery_note.customer:
+		delivery_note.customer = pick_list.customer
+
 	item_table_mapper_without_so = {
 		"doctype": "Delivery Note Item",
 		"field_map": {
@@ -1415,6 +1457,9 @@ def map_pl_locations(pick_list, item_mapper, delivery_note, sales_order=None):
 		if location.sales_order != sales_order or location.product_bundle_item:
 			continue
 
+		if flt(location.picked_qty) - flt(location.delivered_qty) <= 0:
+			continue
+
 		if location.sales_order_item:
 			sales_order_item = frappe.get_doc("Sales Order Item", location.sales_order_item)
 		else:
@@ -1470,12 +1515,10 @@ def add_product_bundles_to_delivery_note(
 
 
 @frappe.whitelist()
-def create_stock_entry(pick_list):
-	pick_list = frappe.get_doc(json.loads(pick_list))
+def create_stock_entry(pick_list: str | dict):
+	pick_list = frappe.get_doc(frappe.parse_json(pick_list))
+	pick_list.check_permission("read")
 	validate_item_locations(pick_list)
-
-	if stock_entry_exists(pick_list.get("name")):
-		return frappe.msgprint(_("Stock Entry has been already created against this Pick List"))
 
 	stock_entry = frappe.new_doc("Stock Entry")
 	stock_entry.pick_list = pick_list.get("name")
@@ -1490,6 +1533,9 @@ def create_stock_entry(pick_list):
 	else:
 		stock_entry = update_stock_entry_items_with_no_reference(pick_list, stock_entry)
 
+	if not stock_entry.get("items"):
+		return frappe.msgprint(_("All picked items have already been transferred against this Pick List"))
+
 	stock_entry.set_missing_values()
 
 	return stock_entry.as_dict()
@@ -1497,6 +1543,9 @@ def create_stock_entry(pick_list):
 
 @frappe.whitelist()
 def get_pending_work_orders(doctype, txt, searchfield, start, page_length, filters, as_dict):
+	# same guard as the sibling get_pick_list_query; a Work Order guard would lose Stock and Manufacturing Manager
+	frappe.has_permission("Pick List", throw=True)
+
 	wo = frappe.qb.DocType("Work Order")
 	return (
 		frappe.qb.from_(wo)
@@ -1517,6 +1566,8 @@ def get_pending_work_orders(doctype, txt, searchfield, start, page_length, filte
 
 @frappe.whitelist()
 def get_item_details(item_code, uom=None, warehouse=None, company=None):
+	frappe.has_permission("Pick List", throw=True)
+
 	details = frappe.db.get_value("Item", item_code, "stock_uom", as_dict=1)
 	details.uom = uom or details.stock_uom
 	if uom:
@@ -1591,6 +1642,8 @@ def update_stock_entry_based_on_work_order(pick_list, stock_entry):
 	stock_entry.project = work_order.project
 
 	for location in pick_list.locations:
+		if get_pending_transfer_stock_qty(location) <= 0:
+			continue
 		item = frappe._dict()
 		update_common_item_properties(item, location)
 		item.t_warehouse = wip_warehouse
@@ -1602,6 +1655,8 @@ def update_stock_entry_based_on_work_order(pick_list, stock_entry):
 
 def update_stock_entry_based_on_material_request(pick_list, stock_entry):
 	for location in pick_list.locations:
+		if get_pending_transfer_stock_qty(location) <= 0:
+			continue
 		target_warehouse = None
 		if location.material_request_item:
 			target_warehouse = frappe.get_value(
@@ -1617,6 +1672,8 @@ def update_stock_entry_based_on_material_request(pick_list, stock_entry):
 
 def update_stock_entry_items_with_no_reference(pick_list, stock_entry):
 	for location in pick_list.locations:
+		if get_pending_transfer_stock_qty(location) <= 0:
+			continue
 		item = frappe._dict()
 		update_common_item_properties(item, location)
 
@@ -1625,11 +1682,18 @@ def update_stock_entry_items_with_no_reference(pick_list, stock_entry):
 	return stock_entry
 
 
+def get_pending_transfer_stock_qty(location):
+	"""Stock qty of this pick list row still to be moved into a Stock Entry."""
+	return flt(location.picked_qty) - flt(location.transferred_qty)
+
+
 def update_common_item_properties(item, location):
+	pending_stock_qty = get_pending_transfer_stock_qty(location)
 	item.item_code = location.item_code
+	item.item_name = location.item_name
 	item.s_warehouse = location.warehouse
-	item.transfer_qty = location.picked_qty
-	item.qty = flt(location.picked_qty / (location.conversion_factor or 1), location.precision("qty"))
+	item.transfer_qty = pending_stock_qty
+	item.qty = flt(pending_stock_qty / (location.conversion_factor or 1), location.precision("qty"))
 	item.uom = location.uom
 	item.conversion_factor = location.conversion_factor
 	item.stock_uom = location.stock_uom
@@ -1637,6 +1701,7 @@ def update_common_item_properties(item, location):
 	item.serial_no = location.serial_no
 	item.batch_no = location.batch_no
 	item.material_request_item = location.material_request_item
+	item.pick_list_item = location.name
 
 
 def get_rejected_warehouses():

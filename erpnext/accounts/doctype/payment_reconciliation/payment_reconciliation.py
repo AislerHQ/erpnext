@@ -455,6 +455,13 @@ class PaymentReconciliation(Document):
 		default_exchange_gain_loss_account = frappe.get_cached_value(
 			"Company", self.company, "exchange_gain_loss_account"
 		)
+		account_currency = frappe.get_cached_value(
+			"Account", self.receivable_payable_account, "account_currency"
+		)
+		allocated_amount_precision = get_field_precision(
+			frappe.get_meta("Payment Reconciliation Allocation").get_field("allocated_amount"),
+			currency=account_currency,
+		)
 
 		entries = []
 		for pay in args.get("payments"):
@@ -462,11 +469,17 @@ class PaymentReconciliation(Document):
 			for inv in args.get("invoices"):
 				if pay.get("amount") >= inv.get("outstanding_amount"):
 					res = self.get_allocated_entry(pay, inv, inv["outstanding_amount"])
-					pay["amount"] = flt(pay.get("amount")) - flt(inv.get("outstanding_amount"))
+					pay["amount"] = flt(
+						flt(pay.get("amount")) - flt(inv.get("outstanding_amount")),
+						allocated_amount_precision,
+					)
 					inv["outstanding_amount"] = 0
 				else:
 					res = self.get_allocated_entry(pay, inv, pay["amount"])
-					inv["outstanding_amount"] = flt(inv.get("outstanding_amount")) - flt(pay.get("amount"))
+					inv["outstanding_amount"] = flt(
+						flt(inv.get("outstanding_amount")) - flt(pay.get("amount")),
+						allocated_amount_precision,
+					)
 					pay["amount"] = 0
 
 				inv["exchange_rate"] = invoice_exchange_map.get(inv.get("invoice_number"))
@@ -796,10 +809,17 @@ class PaymentReconciliation(Document):
 
 
 def reconcile_dr_cr_note(dr_cr_notes, company, active_dimensions=None):
+	allocated_amount_precision = get_field_precision(
+		frappe.get_meta("Payment Reconciliation Allocation").get_field("allocated_amount")
+	)
 	for inv in dr_cr_notes:
 		if (
-			abs(frappe.db.get_value(inv.voucher_type, inv.voucher_no, "outstanding_amount"))
-			< inv.allocated_amount
+			flt(
+				abs(frappe.db.get_value(inv.voucher_type, inv.voucher_no, "outstanding_amount"))
+				- inv.allocated_amount,
+				allocated_amount_precision,
+			)
+			< 0
 		):
 			frappe.throw(
 				_("{0} has been modified after you pulled it. Please pull it again.").format(inv.voucher_type)
